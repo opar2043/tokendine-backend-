@@ -85,6 +85,7 @@ async function run() {
   const attendanceCol = db.collection("attendance");
   const complaintsCol = db.collection("complaints");
   const bonusesCol = db.collection("bonuses");
+  const clientBonusesCol = db.collection("clientBonuses");
   const tablesCol = db.collection("tableAssignments");
   const progressCol = db.collection("dailyProgress");
   const auditCol = db.collection("auditLogs");
@@ -263,6 +264,9 @@ async function run() {
       tokensBought,
       tokensSpent,
       balance: tokensBought - tokensSpent,
+      // Mobiles of people THIS client has referred (filled when others register
+      // using this client's mobile as their referral).
+      referrals: [],
       createdAt: new Date(),
       updatedAt: new Date(),
     };
@@ -279,6 +283,8 @@ async function run() {
               tokensBought: REFERRAL_BONUS_TOKENS,
               balance: REFERRAL_BONUS_TOKENS,
             },
+            // Store the referred person's mobile in the referrer's array.
+            $addToSet: { referrals: mobile },
             $set: { updatedAt: new Date() },
           }
         );
@@ -372,6 +378,28 @@ async function run() {
     res.status(201).json(withId({ ...purchase, _id: inserted.insertedId }));
   });
 
+  app.delete("/clients/:id/purchases/:purchaseId", async (req, res) => {
+    const cid = toOid(req.params.id);
+    const pid = toOid(req.params.purchaseId);
+    if (!cid || !pid) return res.status(400).json({ error: "Invalid ID" });
+    
+    // We optionally reimburse tokensSpent if required, but the prompt just wants a delete route
+    const purchase = await purchasesCol.findOne({ _id: pid, clientId: cid });
+    if (purchase && purchase.tokensUsed) {
+      await clientsCol.updateOne(
+        { _id: cid },
+        { 
+          $inc: { tokensSpent: -purchase.tokensUsed, balance: purchase.tokensUsed },
+          $set: { updatedAt: new Date() }
+        }
+      );
+    }
+    
+    const result = await purchasesCol.deleteOne({ _id: pid, clientId: cid });
+    if (!result.deletedCount) return res.status(404).json({ error: "Not found" });
+    res.status(204).send();
+  });
+
   // ========================================
   // PRODUCTS
   // ========================================
@@ -385,7 +413,19 @@ async function run() {
   });
 
   app.post("/products", async (req, res) => {
-    const { name, image, category, costPrice, sellingPrice, stock } = req.body;
+    const { name, image, category, costPrice, sellingPrice, stock, productId } =
+      req.body;
+
+    // Optional admin-supplied custom product id (a human-friendly code).
+    const code = (productId || "").toString().trim();
+    if (code) {
+      const clash = await productsCol.findOne({ productId: code });
+      if (clash)
+        return res
+          .status(409)
+          .json({ error: "A product with that ID already exists." });
+    }
+
     const doc = {
       name,
       image,
@@ -397,6 +437,7 @@ async function run() {
       addedOn: new Date(),
       updatedOn: new Date(),
     };
+    if (code) doc.productId = code;
     const result = await productsCol.insertOne(doc);
     res.status(201).json(withId({ ...doc, _id: result.insertedId }));
   });
@@ -505,6 +546,33 @@ async function run() {
     res.status(201).json(withId({ ...doc, _id: result.insertedId }));
   });
 
+  // Manager/admin records (or overrides) attendance for a specific worker.
+  // Upserts a single entry per worker per day so re-marking updates in place.
+  app.post("/attendance", async (req, res) => {
+    const { workerId, status = "present", date } = req.body;
+    const wid = toOid(workerId);
+    if (!wid) return res.status(400).json({ error: "Invalid worker ID" });
+
+    const day = date ? new Date(date) : new Date();
+    day.setHours(0, 0, 0, 0);
+    const end = new Date(day);
+    end.setDate(end.getDate() + 1);
+
+    await attendanceCol.updateOne(
+      { workerId: wid, date: { $gte: day, $lt: end } },
+      {
+        $set: { workerId: wid, date: day, status },
+        $setOnInsert: { createdAt: new Date() },
+      },
+      { upsert: true }
+    );
+    const a = await attendanceCol.findOne({
+      workerId: wid,
+      date: { $gte: day, $lt: end },
+    });
+    res.status(201).json(withId(a));
+  });
+
   app.patch("/attendance/:id/status", async (req, res) => {
     const { status } = req.body;
     await attendanceCol.updateOne(
@@ -528,10 +596,11 @@ async function run() {
   });
 
   app.post("/complaints", async (req, res) => {
-    const { byId, subject } = req.body;
+    const { byId, subject, clientMobile } = req.body;
     const doc = {
       byId: toOid(byId),
       subject,
+      clientMobile: (clientMobile || "").toString().trim() || null,
       date: new Date(),
       status: "open",
     };
@@ -548,6 +617,12 @@ async function run() {
     const c = await complaintsCol.findOne({ _id: toOid(req.params.id) });
     if (!c) return res.status(404).json({ error: "Not found" });
     res.json(withId(c));
+  });
+
+  app.delete("/complaints/:id", async (req, res) => {
+    const result = await complaintsCol.deleteOne({ _id: toOid(req.params.id) });
+    if (!result.deletedCount) return res.status(404).json({ error: "Not found" });
+    res.status(204).send();
   });
 
   // ========================================
@@ -577,6 +652,54 @@ async function run() {
       date: new Date(),
     });
     res.status(201).json(withId({ ...doc, _id: result.insertedId }));
+  });
+
+  app.delete("/bonuses/:id", async (req, res) => {
+    const result = await bonusesCol.deleteOne({ _id: toOid(req.params.id) });
+    if (!result.deletedCount) return res.status(404).json({ error: "Not found" });
+    res.status(204).send();
+  });
+
+  // ========================================
+  // CLIENT BONUSES
+  // ========================================
+  app.get("/clients-bonuses", async (req, res) => {
+    const { workerId, clientId } = req.query;
+    const query = {};
+    if (workerId) query.workerId = toOid(workerId);
+    if (clientId) query.clientId = toOid(clientId);
+    const items = await clientBonusesCol.find(query).sort({ date: -1 }).toArray();
+    res.json({ items: items.map(withId) });
+  });
+
+  app.post("/clients-bonuses", async (req, res) => {
+    const { workerId, clientId, amount, reason } = req.body;
+    const wid = toOid(workerId);
+    const cid = toOid(clientId);
+    const doc = { workerId: wid, clientId: cid, amount, reason, date: new Date() };
+    const result = await clientBonusesCol.insertOne(doc);
+    
+    // Add bonus tokens to the client
+    if (amount > 0) {
+      await clientsCol.updateOne(
+        { _id: cid },
+        { $inc: { balance: amount, tokensBought: amount }, $set: { updatedAt: new Date() } }
+      );
+    }
+
+    await auditCol.insertOne({
+      action: "clientBonus.add",
+      targetId: cid,
+      payload: { amount, reason, workerId },
+      date: new Date(),
+    });
+    res.status(201).json(withId({ ...doc, _id: result.insertedId }));
+  });
+
+  app.delete("/clients-bonuses/:id", async (req, res) => {
+    const result = await clientBonusesCol.deleteOne({ _id: toOid(req.params.id) });
+    if (!result.deletedCount) return res.status(404).json({ error: "Not found" });
+    res.status(204).send();
   });
 
   // ========================================
@@ -647,6 +770,12 @@ async function run() {
     };
     const result = await progressCol.insertOne(doc);
     res.status(201).json(withId({ ...doc, _id: result.insertedId }));
+  });
+
+  app.delete("/progress/:id", async (req, res) => {
+    const result = await progressCol.deleteOne({ _id: toOid(req.params.id) });
+    if (!result.deletedCount) return res.status(404).json({ error: "Not found" });
+    res.status(204).send();
   });
 
   // ========================================
@@ -727,12 +856,94 @@ async function run() {
         week: week.revenue,
         month: month.revenue,
       },
+      // Tokens are the primary unit of the system (revenue/BDT kept only for
+      // product margin calculations).
+      tokens: {
+        total: total.tokens,
+        day: day.tokens,
+        week: week.tokens,
+        month: month.tokens,
+      },
       tokensSold: total.tokens,
+      totalProducts: await productsCol.countDocuments({}),
       activeClients,
       stockAlerts,
       referralCount: referrals,
       profitEstimate: profitAgg[0]?.profit || 0,
     });
+  });
+
+  // ----------------------------------------------------------------
+  // PRODUCT FLOW — which product sold how much (tokens + BDT margin).
+  // Supports ?from=&to= ISO date filtering.
+  // ----------------------------------------------------------------
+  app.get("/analytics/product-flow", async (req, res) => {
+    const { from, to } = req.query;
+    const match = {};
+    if (from || to) {
+      match.date = {};
+      if (from) match.date.$gte = new Date(from);
+      if (to) match.date.$lte = new Date(to);
+    }
+
+    const rows = await purchasesCol
+      .aggregate([
+        ...(Object.keys(match).length ? [{ $match: match }] : []),
+        {
+          $group: {
+            _id: "$productId",
+            productName: { $first: "$productName" },
+            qtySold: { $sum: "$qty" },
+            tokensUsed: { $sum: "$tokensUsed" },
+            amount: { $sum: "$amount" },
+            orders: { $sum: 1 },
+          },
+        },
+        {
+          $lookup: {
+            from: "products",
+            localField: "_id",
+            foreignField: "_id",
+            as: "product",
+          },
+        },
+        { $unwind: { path: "$product", preserveNullAndEmptyArrays: true } },
+        {
+          $project: {
+            _id: 0,
+            productId: "$_id",
+            code: "$product.productId",
+            productName: 1,
+            qtySold: 1,
+            tokensUsed: 1,
+            amount: 1,
+            orders: 1,
+            costPrice: "$product.costPrice",
+            sellingPrice: "$product.sellingPrice",
+            category: "$product.category",
+            image: "$product.image",
+            margin: {
+              $multiply: [
+                {
+                  $subtract: [
+                    { $ifNull: ["$product.sellingPrice", 0] },
+                    { $ifNull: ["$product.costPrice", 0] },
+                  ],
+                },
+                "$qtySold",
+              ],
+            },
+          },
+        },
+        { $sort: { tokensUsed: -1 } },
+      ])
+      .toArray();
+
+    const items = rows.map((r) => ({
+      ...r,
+      productId: r.productId ? r.productId.toString() : null,
+    }));
+    res.json({ items });
   });
 
   app.get("/analytics/worker/:id", async (req, res) => {
